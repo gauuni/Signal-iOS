@@ -13,11 +13,19 @@ import CloudKit
     static let signalBackupRecordType = "signalBackup"
     static let manifestRecordName = "manifest"
     static let payloadKey = "payload"
+    static let maxImmediateRetries = 5
 
-    @objc
-    public class func recordIdForTest() -> String {
+    private class func recordIdForTest() -> String {
         return "test-\(NSUUID().uuidString)"
     }
+
+    private class func database() -> CKDatabase {
+        let myContainer = CKContainer.default()
+        let privateDatabase = myContainer.privateCloudDatabase
+        return privateDatabase
+    }
+
+    // MARK: - Upload
 
     @objc
     public class func saveTestFileToCloud(fileUrl: URL,
@@ -40,9 +48,9 @@ import CloudKit
                                                        failure: @escaping (Error) -> Swift.Void) {
         saveFileToCloud(fileUrl: fileUrl,
                         recordName: "ephemeralFile-\(NSUUID().uuidString)",
-                        recordType: signalBackupRecordType,
-                        success: success,
-                        failure: failure)
+            recordType: signalBackupRecordType,
+            success: success,
+            failure: failure)
     }
 
     // "Persistent" files may be shared between backup export; they should only be saved
@@ -92,47 +100,43 @@ import CloudKit
     public class func saveRecordToCloud(record: CKRecord,
                                         success: @escaping (String) -> Swift.Void,
                                         failure: @escaping (Error) -> Swift.Void) {
-
-        let myContainer = CKContainer.default()
-        let privateDatabase = myContainer.privateCloudDatabase
-        privateDatabase.save(record) {
-            (record, error) in
-
-            if let error = error {
-                Logger.error("\(self.logTag) error saving record: \(error)")
-                failure(error)
-            } else {
-                guard let recordName = record?.recordID.recordName else {
-                    Logger.error("\(self.logTag) error retrieving saved record's name.")
-                    failure(OWSErrorWithCodeDescription(.exportBackupError,
-                                                        NSLocalizedString("BACKUP_EXPORT_ERROR_SAVE_FILE_TO_CLOUD_FAILED",
-                                                                          comment: "Error indicating the a backup export failed to save a file to the cloud.")))
-                    return
-                }
-                Logger.info("\(self.logTag) saved record.")
-                success(recordName)
-            }
-        }
+        saveRecordToCloud(record: record,
+                          remainingRetries: maxImmediateRetries,
+                          success: success,
+                          failure: failure)
     }
 
-    @objc
-    public class func deleteRecordFromCloud(recordName: String,
-                                            success: @escaping (Swift.Void) -> Swift.Void,
-                                            failure: @escaping (Error) -> Swift.Void) {
+    private class func saveRecordToCloud(record: CKRecord,
+                                         remainingRetries: Int,
+                                         success: @escaping (String) -> Swift.Void,
+                                         failure: @escaping (Error) -> Swift.Void) {
 
-        let recordID = CKRecordID(recordName: recordName)
+        database().save(record) {
+            (_, error) in
 
-        let myContainer = CKContainer.default()
-        let privateDatabase = myContainer.privateCloudDatabase
-        privateDatabase.delete(withRecordID: recordID) {
-            (record, error) in
-
-            if let error = error {
-                Logger.error("\(self.logTag) error deleting record: \(error)")
-                failure(error)
-            } else {
-                Logger.info("\(self.logTag) deleted record.")
-                success()
+            let response = responseForCloudKitError(error: error,
+                                                    remainingRetries: remainingRetries,
+                                                    label: "Save Record")
+            switch response {
+            case .success:
+                let recordName = record.recordID.recordName
+                success(recordName)
+            case .failureDoNotRetry(let responseError):
+                failure(responseError)
+            case .failureRetryAfterDelay(let retryDelay):
+                DispatchQueue.global().asyncAfter(deadline: DispatchTime.now() + retryDelay, execute: {
+                    saveRecordToCloud(record: record,
+                                      remainingRetries: remainingRetries - 1,
+                                      success: success,
+                                      failure: failure)
+                })
+            case .failureRetryWithoutDelay:
+                DispatchQueue.global().async {
+                    saveRecordToCloud(record: record,
+                                      remainingRetries: remainingRetries - 1,
+                                      success: success,
+                                      failure: failure)
+                }
             }
         }
     }
@@ -207,9 +211,59 @@ import CloudKit
                             failure: failure)
     }
 
+    // MARK: - Delete
+
+    @objc
+    public class func deleteRecordFromCloud(recordName: String,
+                                            success: @escaping (Swift.Void) -> Swift.Void,
+                                            failure: @escaping (Error) -> Swift.Void) {
+        deleteRecordFromCloud(recordName: recordName,
+                              remainingRetries: maxImmediateRetries,
+                              success: success,
+                              failure: failure)
+    }
+
+    private class func deleteRecordFromCloud(recordName: String,
+                                             remainingRetries: Int,
+                                             success: @escaping (Swift.Void) -> Swift.Void,
+                                             failure: @escaping (Error) -> Swift.Void) {
+
+        let recordID = CKRecordID(recordName: recordName)
+
+        database().delete(withRecordID: recordID) {
+            (record, error) in
+
+            let response = responseForCloudKitError(error: error,
+                                                    remainingRetries: remainingRetries,
+                                                    label: "Delete Record")
+            switch response {
+            case .success:
+                success()
+            case .failureDoNotRetry(let responseError):
+                failure(responseError)
+            case .failureRetryAfterDelay(let retryDelay):
+                DispatchQueue.global().asyncAfter(deadline: DispatchTime.now() + retryDelay, execute: {
+                    deleteRecordFromCloud(recordName: recordName,
+                                          remainingRetries: remainingRetries - 1,
+                                          success: success,
+                                          failure: failure)
+                })
+            case .failureRetryWithoutDelay:
+                DispatchQueue.global().async {
+                    deleteRecordFromCloud(recordName: recordName,
+                                          remainingRetries: remainingRetries - 1,
+                                          success: success,
+                                          failure: failure)
+                }
+            }
+        }
+    }
+
+    // MARK: - Exists?
+
     private class func checkForFileInCloud(recordName: String,
-                                          success: @escaping (CKRecord?) -> Swift.Void,
-                                          failure: @escaping (Error) -> Swift.Void) {
+                                           success: @escaping (CKRecord?) -> Swift.Void,
+                                           failure: @escaping (Error) -> Swift.Void) {
         let recordId = CKRecordID(recordName: recordName)
         let fetchOperation = CKFetchRecordsOperation(recordIDs: [recordId ])
         // Don't download the file; we're just using the fetch to check whether or
@@ -240,9 +294,7 @@ import CloudKit
             // Record found.
             success(record)
         }
-        let myContainer = CKContainer.default()
-        let privateDatabase = myContainer.privateCloudDatabase
-        privateDatabase.add(fetchOperation)
+        database().add(fetchOperation)
     }
 
     @objc
@@ -277,7 +329,7 @@ import CloudKit
 
         var allRecordNames = previousRecordNames
 
-        let  queryOperation = CKQueryOperation(query: query)
+        let queryOperation = CKQueryOperation(query: query)
         // If this isn't the first page of results for this query, resume
         // where we left off.
         queryOperation.cursor = cursor
@@ -306,19 +358,18 @@ import CloudKit
             Logger.info("\(self.logTag) fetched \(allRecordNames.count) record names.")
             success(allRecordNames)
         }
-
-        let myContainer = CKContainer.default()
-        let privateDatabase = myContainer.privateCloudDatabase
-        privateDatabase.add(queryOperation)
+        database().add(queryOperation)
     }
+
+    // MARK: - Download
 
     @objc
     public class func downloadManifestFromCloud(
-                                            success: @escaping (Data) -> Swift.Void,
-                                            failure: @escaping (Error) -> Swift.Void) {
+        success: @escaping (Data) -> Swift.Void,
+        failure: @escaping (Error) -> Swift.Void) {
         downloadDataFromCloud(recordName: manifestRecordName,
-                                            success: success,
-                                            failure: failure)
+                              success: success,
+                              failure: failure)
     }
 
     @objc
@@ -367,8 +418,8 @@ import CloudKit
     }
 
     private class func downloadFromCloud(recordName: String,
-                                            success: @escaping (CKAsset) -> Swift.Void,
-                                            failure: @escaping (Error) -> Swift.Void) {
+                                         success: @escaping (CKAsset) -> Swift.Void,
+                                         failure: @escaping (Error) -> Swift.Void) {
 
         let recordId = CKRecordID(recordName: recordName)
         let fetchOperation = CKFetchRecordsOperation(recordIDs: [recordId ])
@@ -394,10 +445,10 @@ import CloudKit
             }
             success(asset)
         }
-        let myContainer = CKContainer.default()
-        let privateDatabase = myContainer.privateCloudDatabase
-        privateDatabase.add(fetchOperation)
+        database().add(fetchOperation)
     }
+
+    // MARK: - Access
 
     @objc
     public class func checkCloudKitAccess(completion: @escaping (Bool) -> Swift.Void) {
@@ -421,5 +472,57 @@ import CloudKit
                 }
             }
         })
+    }
+
+    // MARK: - Retry
+
+    private enum CKErrorResponse {
+        case success
+        case failureDoNotRetry(error:Error)
+        case failureRetryAfterDelay(retryDelay: Double)
+        case failureRetryWithoutDelay
+    }
+
+    private class func responseForCloudKitError(error: Error?,
+                                                remainingRetries: Int,
+                                                label: String) -> CKErrorResponse {
+        if let error = error as? CKError {
+            Logger.error("\(self.logTag) \(label) failed: \(error)")
+            if remainingRetries < 1 {
+                Logger.verbose("\(self.logTag) \(label) no more retries.")
+                return .failureDoNotRetry(error:error)
+            }
+
+            if #available(iOS 11, *) {
+                if error.code == CKError.serverResponseLost {
+                    Logger.verbose("\(self.logTag) \(label) retry without delay.")
+                    return .failureRetryWithoutDelay
+                }
+            }
+
+            switch error {
+            case CKError.requestRateLimited, CKError.serviceUnavailable, CKError.zoneBusy:
+                let retryDelay = error.retryAfterSeconds ?? 3.0
+                Logger.verbose("\(self.logTag) \(label) retry with delay: \(retryDelay).")
+                return .failureRetryAfterDelay(retryDelay:retryDelay)
+            case CKError.networkFailure:
+                Logger.verbose("\(self.logTag) \(label) retry without delay.")
+                return .failureRetryWithoutDelay
+            default:
+                Logger.verbose("\(self.logTag) \(label) unknown CKError.")
+                return .failureDoNotRetry(error:error)
+            }
+        } else if let error = error {
+            Logger.error("\(self.logTag) \(label) failed: \(error)")
+            if remainingRetries < 1 {
+                Logger.verbose("\(self.logTag) \(label) no more retries.")
+                return .failureDoNotRetry(error:error)
+            }
+            Logger.verbose("\(self.logTag) \(label) unknown error.")
+            return .failureDoNotRetry(error:error)
+        } else {
+            Logger.info("\(self.logTag) \(label) succeeded.")
+            return .success
+        }
     }
 }
